@@ -515,6 +515,9 @@ gstreamer_backend_evidence_sampled() {
 # -------------------- Single runner: gst-launch with timeout --------------------
 # gstreamer_run_gstlaunch_timeout <secs> <pipelineString>
 # Returns gst-launch rc.
+#
+# Sends SIGINT (not SIGTERM) to trigger proper EOS handling via -e flag.
+# This ensures pipelines with muxers (mp4mux, etc.) can finalize output files.
 gstreamer_run_gstlaunch_timeout() {
   secs="$1"
   pipe="$2"
@@ -525,16 +528,13 @@ gstreamer_run_gstlaunch_timeout() {
   gstreamer_print_cmd_multiline "$pipe"
 
   if [ "$secs" -gt 0 ] 2>/dev/null; then
-    if command -v audio_timeout_run >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
       # shellcheck disable=SC2086
-      audio_timeout_run "${secs}s" "$GSTBIN" $GSTLAUNCHFLAGS $pipe
-      return $?
-    elif command -v timeout >/dev/null 2>&1; then
-      # shellcheck disable=SC2086
-      timeout "$secs" "$GSTBIN" $GSTLAUNCHFLAGS $pipe
+      # Send SIGINT instead of SIGTERM to trigger EOS via -e flag
+      timeout --signal=INT "$secs" "$GSTBIN" $GSTLAUNCHFLAGS $pipe
       return $?
     else
-      log_warn "No timeout command available (audio_timeout_run or timeout), running without timeout"
+      log_warn "No timeout command available, running without timeout"
     fi
   fi
 
@@ -675,6 +675,7 @@ gstreamer_check_errors() {
   if sed \
     -e '/gst_video_info_dma_drm_to_caps: assertion .*drm_fourcc != DRM_FORMAT_INVALID/d' \
     -e "/gst_structure_remove_field: assertion 'IS_MUTABLE (structure)' failed/d" \
+    -e '/WARN.*udmabuf-allocator.*Udmabuf allocator not available.*can'\''t open \/dev\/udmabuf/d' \
     "$logfile" >"$filtered_log" 2>/dev/null; then
     check_log="$filtered_log"
   fi
@@ -770,6 +771,7 @@ gstreamer_validate_log() {
   if sed \
     -e '/gst_video_info_dma_drm_to_caps: assertion .*drm_fourcc != DRM_FORMAT_INVALID/d' \
     -e "/gst_structure_remove_field: assertion 'IS_MUTABLE (structure)' failed/d" \
+    -e '/WARN.*udmabuf-allocator.*Udmabuf allocator not available.*can'\''t open \/dev\/udmabuf/d' \
     "$logfile" >"$filtered_log" 2>/dev/null; then
     check_log="$filtered_log"
   fi
@@ -1531,7 +1533,7 @@ camera_build_qtiqmmfsrc_snapshot_pipeline() {
   output_location="$5"
   max_files="${6:-2}"
   
-  printf '%s\n' "qtiqmmfsrc camera=${camera_id} name=camsrc ! capsfilter caps=\"video/x-raw,format=NV12,width=${width},height=${height},framerate=${framerate}/1\" ! jpegenc ! multifilesink location=\"${output_location}\ max-files=${max_files}"
+  printf '%s\n' "qtiqmmfsrc camera=${camera_id} name=camsrc ! capsfilter caps=\"video/x-raw,format=NV12,width=${width},height=${height},framerate=${framerate}/1\" ! jpegenc ! multifilesink location=\"${output_location}\" max-files=${max_files}"
 }
 
 # -------------------- libcamerasrc pipeline builders --------------------
@@ -1607,7 +1609,7 @@ camera_build_libcamera_snapshot_pipeline() {
   output_location="$3"
   max_files="${4:-5}"
   
-  printf '%s\n' "libcamerasrc name=camsrc src_1::stream-role=still-capture ! video/x-raw,width=${width},height=${height} ! videoconvert ! jpegenc ! multifilesink location=\"${output_location}\ max-files=${max_files}"
+  printf '%s\n' "libcamerasrc name=camsrc src_1::stream-role=still-capture ! video/x-raw,width=${width},height=${height} ! videoconvert ! jpegenc ! multifilesink location=\"${output_location}\" max-files=${max_files}"
 }
 
 # -------------------- Wayland/Weston setup helper --------------------
