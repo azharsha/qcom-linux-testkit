@@ -789,22 +789,12 @@ export GST_DEBUG_FILE="$GST_LOG"
 #   $1: testname
 #   $2: pipeline
 #   $3: output_file (optional, for encode tests)
-#   $4: restart_cam_server (optional, "yes" to restart cam-server before test - qtiqmmfsrc only)
 run_camera_test() {
   testname="$1"
   pipeline="$2"
   output_file="${3:-}"
-  restart_cam_server="${4:-no}"
   
   log_info "=========================================="; log_info "Running: $testname"; log_info "=========================================="
-  
-  # Restart cam-server if requested (temporary workaround for qtiqmmfsrc only)
-  # libcamerasrc doesn't use cam-server, so this is skipped for libcamerasrc tests
-  if [ "$restart_cam_server" = "yes" ] && [ "$camera_source" = "qtiqmmfsrc" ]; then
-    log_info "Restarting cam-server..."
-    systemctl restart cam-server >/dev/null 2>&1 || log_warn "Failed to restart cam-server (may not be critical)"
-    sleep 1
-  fi
   
   test_log="$OUTDIR/${testname}.log"
   : >"$test_log"
@@ -865,7 +855,7 @@ run_qtiqmmf_fakesink_test() {
   log_info "Format: $format_name"
   
   pipeline=$(camera_build_qtiqmmfsrc_fakesink_pipeline "$cameraId" "$format" 1280 720 "$framerate")
-  run_camera_test "$testname" "$pipeline" "" "yes"
+  run_camera_test "$testname" "$pipeline"
 }
 
 # qtiqmmfsrc Preview test
@@ -887,7 +877,7 @@ run_qtiqmmf_preview_test() {
   log_info "Format: $format_name"
   
   pipeline=$(camera_build_qtiqmmfsrc_preview_pipeline "$cameraId" "$format" 3840 2160 "$framerate")
-  run_camera_test "$testname" "$pipeline" "" "yes"
+  run_camera_test "$testname" "$pipeline"
 }
 
 # qtiqmmfsrc Encode test
@@ -915,7 +905,7 @@ run_qtiqmmf_encode_test() {
   log_info "Resolution: $resolution (${width}x${height})"
   
   pipeline=$(camera_build_qtiqmmfsrc_encode_pipeline "$cameraId" "$format" "$width" "$height" "$framerate" "$output_file")
-  run_camera_test "$testname" "$pipeline" "$output_file" "yes"
+  run_camera_test "$testname" "$pipeline" "$output_file"
 }
 
 # qtiqmmfsrc Snapshot test
@@ -954,11 +944,6 @@ run_qtiqmmf_snapshot_test() {
   snapshot_timeout=$((max_files + 5))
   
   log_info "=========================================="; log_info "Running: $testname"; log_info "=========================================="
-  
-  # Restart cam-server before snapshot test (qtiqmmfsrc only)
-  log_info "Restarting cam-server..."
-  systemctl restart cam-server >/dev/null 2>&1 || log_warn "Failed to restart cam-server (may not be critical)"
-  sleep 1
   
   test_log="$OUTDIR/${testname}.log"
   : >"$test_log"
