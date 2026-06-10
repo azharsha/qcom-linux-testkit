@@ -284,6 +284,167 @@ interrupt_counter_delta() {
     '
 }
 
+# Compare per-CPU interrupt counters from two /proc/interrupts lines.
+#
+# Arguments:
+# $1 - initial interrupt line
+# $2 - final interrupt line
+#
+# Return:
+# 0 - all parsed per-CPU counters incremented
+# 1 - fatal parse/count mismatch
+# 2 - counters parsed, but one or more CPUs did not increment yet
+#
+# Sets globals for callers:
+# INTERRUPT_COMPARE_CPU_COUNT
+# INTERRUPT_COMPARE_INITIAL_VALUES
+# INTERRUPT_COMPARE_FINAL_VALUES
+# shellcheck disable=SC2317
+interrupt_cpu_counts_incremented() {
+    initial_line="$1"
+    final_line="$2"
+
+    INTERRUPT_COMPARE_INITIAL_VALUES="$(extract_interrupt_cpu_counts "$initial_line")"
+    INTERRUPT_COMPARE_FINAL_VALUES="$(extract_interrupt_cpu_counts "$final_line")"
+
+    initial_cpu_count="$(count_interrupt_cpu_counts "$INTERRUPT_COMPARE_INITIAL_VALUES")"
+    final_cpu_count="$(count_interrupt_cpu_counts "$INTERRUPT_COMPARE_FINAL_VALUES")"
+
+    # Export result to caller, used by Interrupts/run.sh after this helper returns.
+    # shellcheck disable=SC2034
+    INTERRUPT_COMPARE_CPU_COUNT="$initial_cpu_count"
+
+    if [ "$initial_cpu_count" -eq 0 ] || [ "$final_cpu_count" -eq 0 ]; then
+        log_fail "No per-CPU interrupt counters could be parsed from /proc/interrupts"
+        return 1
+    fi
+
+    if [ "$initial_cpu_count" -ne "$final_cpu_count" ]; then
+        log_fail "Mismatch in parsed CPU interrupt counters: initial=${initial_cpu_count} final=${final_cpu_count}"
+        return 1
+    fi
+
+    cpu_index=0
+    while [ "$cpu_index" -lt "$initial_cpu_count" ]; do
+        initial_value="$(printf '%s\n' "$INTERRUPT_COMPARE_INITIAL_VALUES" | sed -n "$((cpu_index + 1))p")"
+        final_value="$(printf '%s\n' "$INTERRUPT_COMPARE_FINAL_VALUES" | sed -n "$((cpu_index + 1))p")"
+
+        if [ "$initial_value" -ge "$final_value" ]; then
+            return 2
+        fi
+
+        cpu_index=$((cpu_index + 1))
+    done
+
+    return 0
+}
+
+# Poll a named interrupt until all per-CPU counters increment.
+#
+# Arguments:
+# $1 - interrupt name/pattern, for example arch_timer
+# $2 - timeout seconds
+# $3 - poll interval seconds
+#
+# Return:
+# 0 - interrupt counters incremented on all CPUs
+# 1 - fatal error / timeout
+#
+# Sets globals for callers:
+# INTERRUPT_WAIT_INITIAL_LINE
+# INTERRUPT_WAIT_FINAL_LINE
+# INTERRUPT_WAIT_IRQ_ID
+# INTERRUPT_WAIT_ELAPSED_S
+# INTERRUPT_COMPARE_CPU_COUNT
+# INTERRUPT_COMPARE_INITIAL_VALUES
+# INTERRUPT_COMPARE_FINAL_VALUES
+# shellcheck disable=SC2317
+wait_for_interrupt_cpu_count_increment() {
+    irq_name="$1"
+    timeout_s="$2"
+    poll_interval_s="$3"
+
+    if ! is_unsigned_number "$timeout_s"; then
+        log_warn "Invalid interrupt wait timeout '${timeout_s}', using 30"
+        timeout_s=30
+    fi
+
+    if ! is_unsigned_number "$poll_interval_s"; then
+        log_warn "Invalid interrupt poll interval '${poll_interval_s}', using 2"
+        poll_interval_s=2
+    fi
+
+    if [ "$poll_interval_s" -eq 0 ]; then
+        log_warn "Interrupt poll interval cannot be 0, using 1"
+        poll_interval_s=1
+    fi
+
+    INTERRUPT_WAIT_INITIAL_LINE="$(get_first_interrupt_line_by_name "$irq_name")"
+    INTERRUPT_WAIT_FINAL_LINE=""
+    INTERRUPT_WAIT_IRQ_ID=""
+    INTERRUPT_WAIT_ELAPSED_S=0
+
+    if [ -z "$INTERRUPT_WAIT_INITIAL_LINE" ]; then
+        log_fail "Could not find interrupt line matching '${irq_name}' in /proc/interrupts"
+        return 1
+    fi
+
+    INTERRUPT_WAIT_IRQ_ID="$(printf '%s\n' "$INTERRUPT_WAIT_INITIAL_LINE" | awk '{ print $1 }')"
+
+    log_info "Initial interrupt line for '${irq_name}':"
+    log_info "$INTERRUPT_WAIT_INITIAL_LINE"
+    log_info "Polling '${irq_name}' interrupt counters, timeout=${timeout_s}s interval=${poll_interval_s}s"
+
+    waited=0
+
+    while [ "$waited" -le "$timeout_s" ]; do
+        current_line="$(get_interrupt_line_by_name "$irq_name" | awk -v irq="$INTERRUPT_WAIT_IRQ_ID" '$1 == irq { print; exit }')"
+
+        if [ -n "$current_line" ]; then
+            INTERRUPT_WAIT_FINAL_LINE="$current_line"
+
+            interrupt_cpu_counts_incremented "$INTERRUPT_WAIT_INITIAL_LINE" "$INTERRUPT_WAIT_FINAL_LINE"
+            compare_rc=$?
+
+            case "$compare_rc" in
+                0)
+                    INTERRUPT_WAIT_ELAPSED_S="$waited"
+                    log_info "Final interrupt line for '${irq_name}' after ${waited}s:"
+                    log_info "$INTERRUPT_WAIT_FINAL_LINE"
+                    return 0
+                    ;;
+                1)
+                    INTERRUPT_WAIT_ELAPSED_S="$waited"
+                    return 1
+                    ;;
+                2)
+                    :
+                    ;;
+            esac
+        else
+            log_warn "Interrupt line '${irq_name}' with IRQ ${INTERRUPT_WAIT_IRQ_ID} not found while polling"
+        fi
+
+        if [ "$waited" -ge "$timeout_s" ]; then
+            break
+        fi
+
+        sleep "$poll_interval_s"
+        waited=$((waited + poll_interval_s))
+    done
+
+    # Export result to caller, used by Interrupts/run.sh after this helper returns.
+    # shellcheck disable=SC2034
+    INTERRUPT_WAIT_ELAPSED_S="$waited"
+
+    if [ -n "$INTERRUPT_WAIT_FINAL_LINE" ]; then
+        log_info "Last interrupt line for '${irq_name}' after timeout:"
+        log_info "$INTERRUPT_WAIT_FINAL_LINE"
+    fi
+
+    log_fail "Interrupt counters for '${irq_name}' did not increment on all CPUs within ${timeout_s}s"
+    return 1
+}
 
 # Run bounded workload pinned to one CPU.
 #
