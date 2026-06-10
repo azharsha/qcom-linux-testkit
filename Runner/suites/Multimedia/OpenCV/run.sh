@@ -50,6 +50,7 @@ DEFAULT_FILTER="-tracking_GOTURN.GOTURN/*"
 CLI_FILTER=""
 
 BIN_PATH="" # --bin <path|name>
+BIN_LIST="" # --bin-list "bin1 bin2 ..."
 BUILD_DIR="." # --build-dir
 CWD="." # --cwd
 TESTDATA_PATH="" # --testdata
@@ -67,6 +68,7 @@ print_usage() {
     cat <<EOF
 Usage: $0 [options]
   --bin <path|name> Run a single OpenCV gtest/perf binary (overrides --suite)
+  --bin-list "<bin1 bin2 ...>" Run selected OpenCV binaries and aggregate result
   --build-dir <path> Root to search for binaries (default: .)
   --suite <name> accuracy | performance | all (default: all)
   --filter <pattern> gtest filter for all runs (default from env or "-tracking_GOTURN.GOTURN/*")
@@ -90,6 +92,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --bin) BIN_PATH="$2"; shift 2 ;;
+	--bin-list) BIN_LIST="$2"; shift 2 ;;
         --build-dir) BUILD_DIR="$2"; shift 2 ;;
         --suite) SUITE="$2"; shift 2 ;;
         --filter) CLI_FILTER="$2"; shift 2 ;;
@@ -260,7 +263,15 @@ run_one() {
         fi
     ) >"$run_log" 2>&1
     rc=$?
-    [ "$rc" -eq 124 ] && rc=1 # timeout => fail
+    timed_out=0
+
+    case "$rc" in
+        124|137|143)
+            if [ -n "$TIMEOUT_SECS" ]; then
+                timed_out=1
+            fi
+            ;;
+    esac
 
     if [ "$rc" -eq 0 ] && parse_zero_tests_as_skip "$run_log"; then
         log_skip "$bin_short : No tests executed — SKIP"
@@ -276,13 +287,18 @@ run_one() {
         append_summary "$bin_short" "PASS" "$run_log"
         log_info "----- END $bin_short (rc=0, PASS) @ $(date '+%Y-%m-%d %H:%M:%S') -----"
         return 0
+    fi
+
+    if [ "$timed_out" -eq 1 ]; then
+        log_fail "$bin_short : FAIL/TIMEOUT after ${TIMEOUT_SECS}s (exit=$rc). See: $run_log"
     else
         log_fail "$bin_short : FAIL (exit=$rc). See: $run_log"
-        echo "$bin_short FAIL" >> "$RESLIST_FILE"
-        append_summary "$bin_short" "FAIL" "$run_log"
-        log_info "----- END $bin_short (rc=$rc, FAIL) @ $(date '+%Y-%m-%d %H:%M:%S') -----"
-        return 1
     fi
+
+    echo "$bin_short FAIL" >> "$RESLIST_FILE"
+    append_summary "$bin_short" "FAIL" "$run_log"
+    log_info "----- END $bin_short (rc=$rc, FAIL) @ $(date '+%Y-%m-%d %H:%M:%S') -----"
+    return 1 
 }
 
 discover_bins() {
@@ -351,6 +367,53 @@ if [ -n "$BIN_PATH" ]; then
         2) echo "$TESTNAME SKIP" > "$RES_FILE"; exit 2 ;;
         *) echo "$TESTNAME FAIL" > "$RES_FILE"; exit 1 ;;
     esac
+fi
+
+# ----- selected binary list mode: bounded CI smoke set -----
+if [ -n "$BIN_LIST" ]; then
+    PASS=0
+    FAIL=0
+    SKIP=0
+
+    for BIN_SHORT in $BIN_LIST; do
+        [ -n "$BIN_SHORT" ] || continue
+
+        run_one "$BIN_SHORT" ""
+        rc=$?
+
+        if [ "$rc" -eq 0 ]; then
+            PASS=$((PASS + 1))
+        elif [ "$rc" -eq 2 ]; then
+            SKIP=$((SKIP + 1))
+        else
+            FAIL=$((FAIL + 1))
+        fi
+    done
+
+    echo ""
+    echo "========= OpenCV Suite Summary ========="
+    printf "%-32s %-4s %s\n" "TEST" "RES" "LOG"
+    cat "$SUMMARY_FILE"
+    echo "----------------------------------------"
+    echo "Totals: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
+
+    if [ "$FAIL" -gt 0 ]; then
+        echo "$TESTNAME FAIL" > "$RES_FILE"
+        exit 1
+    fi
+
+    if [ "$PASS" -gt 0 ]; then
+        echo "$TESTNAME PASS" > "$RES_FILE"
+        exit 0
+    fi
+
+    if [ "$SKIP" -gt 0 ]; then
+        echo "$TESTNAME SKIP" > "$RES_FILE"
+        exit 2
+    fi
+
+    echo "$TESTNAME SKIP" > "$RES_FILE"
+    exit 2
 fi
 
 # ----- build suite selection -----
