@@ -1,0 +1,57 @@
+metadata:
+  name: ddr-training
+  format: "Lava-Test Test Definition 1.0"
+  description: Single parametrized DDR Training stage called by LAVA job orchestrator
+  os:
+    - linux
+  scope:
+    - performance
+    - functional
+
+params:
+  # Passed dynamically by the LAVA Job Submission
+  ITER: "1"
+  RUN_HOOK: "pre_reboot" 
+
+  # Tunable parameters
+  CHIPSET: "generic"
+  DDR_TRAINING_TIME_MIN: "0"
+  DDR_TRAINING_TIME_MAX: "10"
+  SERIAL_LOG_DIR: "/var/lib/ddr_serial_logs"  # MUST be /var/lib to survive reboot!
+  BOOT_MARKER: "POST Time"
+  BOOT_TIMEOUT_S: "120"
+  UART_HOST_LOG: ""
+
+run:
+  steps:
+    - cd Runner/suites/Performance/DDR_Training/
+    
+    # Ensure persistent storage exists
+    - mkdir -p /var/lib/ddr_serial_logs
+    
+    # Export parameters for run.sh
+    - export CHIPSET="${CHIPSET}"
+    - export DDR_TRAINING_TIME_MIN="${DDR_TRAINING_TIME_MIN}"
+    - export DDR_TRAINING_TIME_MAX="${DDR_TRAINING_TIME_MAX}"
+    - export SERIAL_LOG_DIR="${SERIAL_LOG_DIR}"
+    - export BOOT_MARKER="${BOOT_MARKER}"
+    - export BOOT_TIMEOUT_S="${BOOT_TIMEOUT_S}"
+    - export UART_HOST_LOG="${UART_HOST_LOG}"
+    
+    # Run the specific stage LAVA asked for
+    - export ITER="${ITER}"
+    - export RUN_HOOK="${RUN_HOOK}"
+    - echo "Executing Iteration ${ITER} -> ${RUN_HOOK}"
+    - sh run.sh || true
+
+    # If this is the parse stage of the final iteration, send results
+    - |
+      if [ "${RUN_HOOK}" = "parse" ] && [ "${ITER}" = "5" ]; then
+        # Assuming run.sh aggregated results into /var/lib/ddr_serial_logs/DDR_Training.res
+        if [ -f /var/lib/ddr_serial_logs/DDR_Training.res ]; then
+           sh ../../../Runner/utils/send-to-lava.sh /var/lib/ddr_serial_logs/DDR_Training.res || true
+        fi
+      fi
+
+parse:
+  pattern: '(?P<test_case_id>(?:TC-DDR-\d+|DDR_Training(?:_iter_\d+)?))\s*:?\s*(?P<result>PASS|FAIL)'
