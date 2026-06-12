@@ -7,10 +7,15 @@ metadata:
   scope:
     - functional
 
+params:
+  WIFI_WAIT_SECS: "60"
+  WIFI_WAIT_STEP_SECS: "2"
+  WIFI_RECOVERY_RELOAD: "1"
+  WIFI_RECOVERY_RELOAD_AFTER_S: ""
+
 run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Connectivity/WiFi/WiFi_OnOff
-    - ./run.sh || true
+    - WIFI_WAIT_SECS="${WIFI_WAIT_SECS}" WIFI_WAIT_STEP_SECS="${WIFI_WAIT_STEP_SECS}" WIFI_RECOVERY_RELOAD="${WIFI_RECOVERY_RELOAD}" WIFI_RECOVERY_RELOAD_AFTER_S="${WIFI_RECOVERY_RELOAD_AFTER_S}" ./run.sh || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh WiFi_OnOff.res
-

@@ -45,6 +45,7 @@ qcom,wcn6750
 qcom,wcn3950
 ath12k
 ath11k
+ath10k
 wifi
 wlan
 qca
@@ -67,6 +68,8 @@ EOF
 
 WIFI_WAIT_SECS="${WIFI_WAIT_SECS:-60}"
 WIFI_WAIT_STEP_SECS="${WIFI_WAIT_STEP_SECS:-2}"
+WIFI_RECOVERY_RELOAD="${WIFI_RECOVERY_RELOAD:-1}"
+WIFI_RECOVERY_RELOAD_AFTER_S="${WIFI_RECOVERY_RELOAD_AFTER_S:-}"
 WIFI_PROBE_LOG_DIR="${WIFI_PROBE_LOG_DIR:-./wifi_onoff_dmesg}"
 WIFI_PROBE_LOG_TAG="${WIFI_PROBE_LOG_TAG:-${TESTNAME}/probe}"
 WIFI_DT_PATTERNS="${WIFI_DT_PATTERNS:-$WIFI_DT_PATTERNS_DEFAULT}"
@@ -96,6 +99,7 @@ log_info "----------------------------------------------------------------------
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 log_info "=== Test Initialization ==="
 log_info "Config: WIFI_WAIT_SECS=${WIFI_WAIT_SECS} WIFI_WAIT_STEP_SECS=${WIFI_WAIT_STEP_SECS}"
+log_info "Config: WIFI_RECOVERY_RELOAD=${WIFI_RECOVERY_RELOAD} WIFI_RECOVERY_RELOAD_AFTER_S=${WIFI_RECOVERY_RELOAD_AFTER_S:-auto}"
 log_info "Config: WIFI_PROBE_LOG_TAG=${WIFI_PROBE_LOG_TAG}"
 
 if [ -n "${WIFI_IFACE:-}" ]; then
@@ -128,9 +132,9 @@ fi
 
 log_info "=== WiFi DT Validation ==="
 if run_with_line_args wifi_dt_present "$WIFI_DT_PATTERNS"; then
-    log_pass "WiFi DT entry/compatible matched."
+    log_pass "WiFi/combined WCN DT entry/compatible matched."
 else
-    log_warn "No WiFi DT entry/compatible matched from configured patterns."
+    log_warn "No WiFi/combined WCN DT entry/compatible matched from configured patterns."
 fi
 
 log_info "=== WiFi Module Visibility ==="
@@ -159,17 +163,21 @@ log_info "=== Waiting for WiFi Interface ==="
 wifi_iface="$(wait_for_wifi_interface "$WIFI_WAIT_SECS" "$WIFI_WAIT_STEP_SECS" || true)"
 
 if [ -z "$wifi_iface" ]; then
-    log_info "No WiFi interface detected after wait. Collecting diagnostics..."
-
+    log_info "No WiFi interface detected after wait/recovery. Collecting diagnostics..."
+ 
     run_with_line_args wifi_dump_debug_info "$WIFI_DT_PATTERNS"
     run_with_line_args wifi_log_module_info "$WIFI_DRIVER_MODULES"
-    wifi_has_probe_failures "$WIFI_PROBE_LOG_DIR" "$WIFI_PROBE_LOG_TAG" || true
-
-    if wifi_stack_present; then
-        log_fail_exit "$TESTNAME" "WiFi stack present, but no usable WiFi interface was found after retries." ""
+ 
+    if wifi_has_probe_failures "$WIFI_PROBE_LOG_DIR" "$WIFI_PROBE_LOG_TAG"; then
+        log_fail_exit "$TESTNAME" "WiFi driver probe/runtime failures detected and no usable WiFi interface was found." ""
     fi
-
-    log_skip_exit "$TESTNAME" "No WiFi interface found and no WiFi stack was detected. Skipping." ""
+ 
+    if wifi_stack_present; then
+        log_fail_exit "$TESTNAME" "WiFi runtime stack is present, but no usable WiFi interface was found after retries." ""
+    fi
+ 
+    log_warn "WiFi modules may be loaded, but no WiFi phy/netdev/runtime object is exposed."
+    log_skip_exit "$TESTNAME" "No usable WiFi interface or runtime WiFi phy/netdev was found. Skipping." ""
 fi
 
 log_pass "Detected WiFi interface: $wifi_iface"
