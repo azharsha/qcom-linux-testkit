@@ -14,58 +14,88 @@ wifi_unblock_rfkill() {
 
 # Retry WiFi interface discovery for a bounded time while unblocking rfkill.
 # Prints interface name on success and returns non-zero on timeout.
+#
+# Optional recovery knobs:
+# WIFI_RECOVERY_RELOAD=1|0
+# Enable one controlled WiFi driver reload if no interface appears.
+#
+# WIFI_RECOVERY_RELOAD_AFTER_S=N
+# Try reload after N seconds of waiting. Default: half of max_wait.
+#
+# WIFI_RECOVERY_MODULES="mod1 mod2 ..."
+# Leaf WiFi driver modules eligible for reload.
+#
+# Notes:
+# - stdout is reserved only for the detected interface name.
+# - diagnostics go to stderr because callers use command substitution.
+# - shared modules such as cfg80211/mac80211/mhi must not be reloaded here.
 wait_for_wifi_interface() {
     max_wait="${1:-60}"
     sleep_step="${2:-2}"
     waited=0
     iface=""
     settle_done=0
- 
+    reload_done=0
+    reload_after=""
+    mod=""
+    recovery_modules="${WIFI_RECOVERY_MODULES:-ath12k_wifi7 ath12k_pci ath12k_ahb ath11k_pci ath11k_ahb ath11k_snoc ath10k_snoc ath10k_pci ath10k_sdio}"
+
     case "$max_wait" in
         ''|*[!0-9]*)
             max_wait=60
             ;;
     esac
- 
+
     case "$sleep_step" in
         ''|*[!0-9]*)
             sleep_step=2
             ;;
     esac
- 
+
     if [ "$max_wait" -le 0 ] 2>/dev/null; then
         max_wait=60
     fi
- 
+
     if [ "$sleep_step" -le 0 ] 2>/dev/null; then
         sleep_step=2
     fi
- 
+
+    reload_after="${WIFI_RECOVERY_RELOAD_AFTER_S:-}"
+    case "$reload_after" in
+        ''|*[!0-9]*)
+            reload_after=$((max_wait / 2))
+            ;;
+    esac
+
+    if [ "$reload_after" -le 0 ] 2>/dev/null; then
+        reload_after="$sleep_step"
+    fi
+
     # Keep stdout reserved only for the detected interface name because callers
     # commonly use command substitution:
-    #   wifi_iface="$(wait_for_wifi_interface ...)"
+    # wifi_iface="$(wait_for_wifi_interface ...)"
     #
     # All diagnostics must go to stderr to avoid contaminating the returned
     # interface name.
     log_info "Waiting up to ${max_wait}s for WiFi interface creation" >&2
- 
+
     while [ "$waited" -lt "$max_wait" ]; do
         wifi_unblock_rfkill
- 
+
         iface="$(get_wifi_interface 2>/dev/null || true)"
         if [ -n "$iface" ]; then
             printf '%s\n' "$iface"
             return 0
         fi
- 
+
         if [ "$settle_done" -eq 0 ]; then
             settle_done=1
- 
+
             if command -v udevadm >/dev/null 2>&1; then
                 log_info "No WiFi interface yet; triggering net add uevents and waiting for udev settle" >&2
                 udevadm trigger --action=add --subsystem-match=net >/dev/null 2>&1 || true
                 udevadm settle --timeout=5 >/dev/null 2>&1 || true
- 
+
                 iface="$(get_wifi_interface 2>/dev/null || true)"
                 if [ -n "$iface" ]; then
                     printf '%s\n' "$iface"
@@ -73,15 +103,60 @@ wait_for_wifi_interface() {
                 fi
             fi
         fi
- 
+
+        if [ "${WIFI_RECOVERY_RELOAD:-1}" = "1" ] &&
+           [ "$reload_done" -eq 0 ] &&
+           [ "$waited" -ge "$reload_after" ] &&
+           command -v modprobe >/dev/null 2>&1; then
+            reload_done=1
+
+            for mod in $recovery_modules; do
+                [ -n "$mod" ] || continue
+
+                if ! is_module_loaded "$mod"; then
+                    continue
+                fi
+
+                log_warn "No WiFi interface after ${waited}s; attempting one controlled reload of $mod" >&2
+
+                if modprobe -r "$mod" >/dev/null 2>&1; then
+                    sleep 2
+
+                    if modprobe "$mod" >/dev/null 2>&1; then
+                        log_info "Reloaded WiFi module: $mod" >&2
+
+                        wifi_unblock_rfkill
+
+                        if command -v udevadm >/dev/null 2>&1; then
+                            udevadm trigger --action=add --subsystem-match=net >/dev/null 2>&1 || true
+                            udevadm settle --timeout=5 >/dev/null 2>&1 || true
+                        fi
+
+                        iface="$(get_wifi_interface 2>/dev/null || true)"
+                        if [ -n "$iface" ]; then
+                            printf '%s\n' "$iface"
+                            return 0
+                        fi
+                    else
+                        log_warn "Reload failed for WiFi module $mod after unload" >&2
+                    fi
+                else
+                    log_warn "Could not unload WiFi module $mod; it may be busy" >&2
+                fi
+
+                # Attempt only one loaded leaf driver module.
+                break
+            done
+        fi
+
         sleep "$sleep_step"
         waited=$((waited + sleep_step))
- 
+
         if [ "$waited" -gt 0 ] && [ $((waited % 10)) -eq 0 ]; then
             log_info "Still waiting for WiFi interface... waited=${waited}s/${max_wait}s" >&2
         fi
     done
- 
+
     return 1
 }
 
@@ -115,19 +190,25 @@ wifi_log_module_info() {
     done
 }
 
-# Return success when there is evidence that a WiFi software stack is present,
-# even if no netdev has been created yet. Used to separate FAIL from SKIP.
+# Return success when there is runtime evidence that WiFi registered a real
+# device/phy/netdev.
+#
+# This intentionally does not treat generic module-only state as success.
+# Modules such as cfg80211, mac80211, and mhi may be loaded even when no WiFi
+# hardware has registered a phy or netdev.
+#
+# Used by tests to decide whether missing interface is a real runtime failure
+# or a platform/no-device skip.
 wifi_stack_present() {
-    mod=""
+    iface=""
 
-    for mod in ath12k_wifi7 ath12k ath11k ath11k_pci ath10k_pci ath10k_snoc cfg80211 mac80211 mhi; do
-        if is_module_loaded "$mod"; then
-            return 0
-        fi
-    done
+    iface="$(get_wifi_interface 2>/dev/null || true)"
+    if [ -n "$iface" ]; then
+        return 0
+    fi
 
     if [ -d /sys/class/ieee80211 ]; then
-        if ls /sys/class/ieee80211/* >/dev/null 2>&1; then
+        if find /sys/class/ieee80211 -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep . >/dev/null 2>&1; then
             return 0
         fi
     fi
@@ -136,7 +217,19 @@ wifi_stack_present() {
         if iw phy 2>/dev/null | grep . >/dev/null 2>&1; then
             return 0
         fi
+
+        if iw dev 2>/dev/null | grep -E '^[[:space:]]*Interface[[:space:]]+' >/dev/null 2>&1; then
+            return 0
+        fi
     fi
+
+    for n in /sys/class/net/*; do
+        [ -e "$n" ] || continue
+
+        if [ -d "$n/wireless" ] || [ -e "$n/phy80211" ]; then
+            return 0
+        fi
+    done
 
     return 1
 }
