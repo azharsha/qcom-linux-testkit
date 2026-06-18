@@ -129,6 +129,14 @@ else
 fi
 
 if [ -n "$ADAPTER" ]; then
+    if [ -n "$BT_ADAPTER" ]; then
+        bt_log_selected_adapter "$ADAPTER" "BT_ADAPTER/CLI"
+    else
+        bt_log_selected_adapter "$ADAPTER" "auto-detect"
+    fi
+fi
+
+if [ -n "$ADAPTER" ]; then
     log_info "Using adapter: $ADAPTER"
 else
     log_warn "No HCI adapter found; skipping test."

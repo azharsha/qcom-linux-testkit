@@ -163,13 +163,21 @@ if [ -n "$BT_ADAPTER" ]; then
     fi
 else
     bt_log_hci_candidates || true
-
+ 
     if command -v bt_select_usable_adapter >/dev/null 2>&1; then
         ADAPTER="$(bt_select_usable_adapter 2>/dev/null || true)"
     elif findhcisysfs >/dev/null 2>&1; then
         ADAPTER="$(findhcisysfs 2>/dev/null || true)"
     else
         ADAPTER=""
+    fi
+fi
+ 
+if [ -n "$ADAPTER" ]; then
+    if [ -n "$BT_ADAPTER" ]; then
+        bt_log_selected_adapter "$ADAPTER" "BT_ADAPTER/CLI"
+    else
+        bt_log_selected_adapter "$ADAPTER" "auto-detect"
     fi
 fi
 

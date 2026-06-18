@@ -114,9 +114,32 @@ else
     inc_warn
 fi
 
+# -----------------------------
+# Adapter should already be detected before firmware-load validation.
+# Keep this fallback for safety.
+# -----------------------------
+if [ -z "$ADAPTER" ]; then
+    if [ -n "$BT_ADAPTER" ]; then
+        ADAPTER="$BT_ADAPTER"
+        log_info "Using adapter from BT_ADAPTER/CLI: $ADAPTER"
+    elif findhcisysfs >/dev/null 2>&1; then
+        ADAPTER="$(findhcisysfs 2>/dev/null || true)"
+    else
+        ADAPTER=""
+    fi
+ 
+    if [ -n "$ADAPTER" ]; then
+        if [ -n "$BT_ADAPTER" ]; then
+            bt_log_selected_adapter "$ADAPTER" "BT_ADAPTER/CLI"
+        else
+            bt_log_selected_adapter "$ADAPTER" "auto-detect"
+        fi
+    fi
+fi
+
 # ---------- Firmware load kernel log ----------
 if command -v btfwloaded >/dev/null 2>&1; then
-    btfwloaded
+    btfwloaded "$ADAPTER"
     rc=$?
     case "$rc" in
         0)
@@ -198,6 +221,14 @@ elif findhcisysfs >/dev/null 2>&1; then
     ADAPTER="$(findhcisysfs 2>/dev/null || true)"
 else
     ADAPTER=""
+fi
+
+if [ -n "$ADAPTER" ]; then
+    if [ -n "$BT_ADAPTER" ]; then
+        bt_log_selected_adapter "$ADAPTER" "BT_ADAPTER/CLI"
+    else
+        bt_log_selected_adapter "$ADAPTER" "auto-detect"
+    fi
 fi
 
 if [ -z "$ADAPTER" ]; then
