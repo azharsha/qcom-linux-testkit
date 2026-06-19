@@ -6171,7 +6171,8 @@ cpu_hotplug_cleanup_registered() {
 #
 # Return:
 # 0 - offline request accepted
-# 1 - offline failed after retry/evidence collection
+# 1 - offline failed with non-EBUSY error
+# 2 - offline returned EBUSY after retries; caller may defer and retry later
 # shellcheck disable=SC2317
 cpu_hotplug_try_offline_with_retry() {
     cpu_index="$1"
@@ -6179,20 +6180,20 @@ cpu_hotplug_try_offline_with_retry() {
     retry_delay="$3"
     out_dir="$4"
     attempt=1
-
+ 
     while [ "$attempt" -le "$retries" ]; do
         log_info "CPU$cpu_index offline attempt $attempt/$retries"
-
+ 
         offline_output="$(cpu_hotplug_write_state "$cpu_index" 0 "offline_attempt${attempt}" "$out_dir" 2>&1)"
         offline_rc=$?
-
+ 
         if [ "$offline_rc" -eq 0 ]; then
             log_info "CPU$cpu_index offline request accepted on attempt $attempt"
             return 0
         fi
-
+ 
         log_warn "CPU$cpu_index offline attempt $attempt failed: ${offline_output:-<no stderr>}"
-
+ 
         if printf '%s\n' "$offline_output" | grep -qi 'Device or resource busy'; then
             log_warn "CPU$cpu_index offline returned EBUSY"
             cpu_hotplug_log_dmesg_tail "$cpu_index" "offline_ebusy_attempt${attempt}" "$out_dir"
@@ -6201,18 +6202,182 @@ cpu_hotplug_try_offline_with_retry() {
             cpu_hotplug_log_dmesg_tail "$cpu_index" "offline_error_attempt${attempt}" "$out_dir"
             return 1
         fi
-
+ 
         attempt=$((attempt + 1))
-
+ 
         if [ "$attempt" -le "$retries" ]; then
             log_info "Waiting ${retry_delay}s before retrying CPU$cpu_index offline"
             sleep "$retry_delay"
         fi
     done
+ 
+    log_warn "CPU$cpu_index offline returned EBUSY after $retries attempts; caller may defer retry"
+    return 2
+}
 
-    log_fail "CPU$cpu_index offline returned EBUSY after $retries attempts"
-    log_fail "CI requires runtime-discovered hotplug-controllable CPUs to support offline/online transition"
-    return 1
+# Validate offline/online hotplug flow for one CPU.
+#
+# Arguments:
+# $1 - CPU index
+# $2 - pass name: primary, deferred-1, etc.
+# $3 - retry count
+# $4 - retry delay seconds
+# $5 - restore delay seconds
+# $6 - output directory
+#
+# Return:
+# 0 - CPU hotplug validation passed
+# 1 - hard failure
+# 2 - persistent EBUSY; caller may defer/retry later
+# 3 - skipped/not applicable
+# shellcheck disable=SC2317
+cpu_hotplug_validate_cpu_once() {
+    cpu_index="$1"
+    pass_name="${2:-primary}"
+    retries="$3"
+    retry_delay="$4"
+    restore_delay="$5"
+    out_dir="$6"
+
+    log_info "----- Testing CPU$cpu_index ($pass_name pass) -----"
+
+    if ! cpu_hotplug_in_online_mask "$cpu_index"; then
+        if [ "$pass_name" = "primary" ]; then
+            log_skip "CPU$cpu_index is not present in the current online CPU mask"
+            skipped=$((skipped + 1))
+            return 3
+        fi
+
+        log_fail "CPU$cpu_index is not online during deferred retry"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+
+    if [ ! -e "$online_file" ]; then
+        if [ "$pass_name" = "primary" ]; then
+            log_skip "CPU$cpu_index has no online control file; not hotplug-controllable on this platform"
+            skipped=$((skipped + 1))
+            return 3
+        fi
+
+        log_fail "CPU$cpu_index lost online control file during deferred retry"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    if [ ! -w "$online_file" ]; then
+        if [ "$pass_name" = "primary" ]; then
+            log_skip "CPU$cpu_index online control file is not writable; not hotplug-controllable in this environment"
+            skipped=$((skipped + 1))
+            return 3
+        fi
+
+        log_fail "CPU$cpu_index online control file is not writable during deferred retry"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    if [ "$pass_name" = "primary" ]; then
+        controllable=$((controllable + 1))
+    fi
+
+    cpu_is_schedulable "$cpu_index"
+    sched_rc=$?
+
+    if [ "$sched_rc" -eq 2 ]; then
+        log_fail "taskset is not available during CPU$cpu_index schedulability check"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    if [ "$sched_rc" -ne 0 ]; then
+        log_fail "CPU$cpu_index is not schedulable before hotplug"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    cpu_hotplug_try_offline_with_retry "$cpu_index" "$retries" "$retry_delay" "$out_dir"
+    offline_rc=$?
+
+    if [ "$offline_rc" -eq 2 ]; then
+        log_warn "CPU$cpu_index still returned EBUSY during $pass_name pass"
+        return 2
+    fi
+
+    if [ "$offline_rc" -ne 0 ]; then
+        log_fail "CPU$cpu_index failed to offline after retry handling"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    cpu_hotplug_record_offlined_cpu "$cpu_index"
+    tested=$((tested + 1))
+
+    sleep "$restore_delay"
+
+    cpu_state="$(cpu_hotplug_read_state "$cpu_index")"
+
+    if [ "$cpu_state" != "0" ]; then
+        log_fail "CPU$cpu_index online state is '${cpu_state:-<empty>}' after offline request, expected 0"
+        failed=$((failed + 1))
+        cpu_hotplug_restore_best_effort "$cpu_index"
+        return 1
+    fi
+
+    if cpu_hotplug_in_online_mask "$cpu_index"; then
+        log_fail "CPU$cpu_index still appears in online mask after offline request"
+        failed=$((failed + 1))
+        cpu_hotplug_restore_best_effort "$cpu_index"
+        return 1
+    fi
+
+    if cpu_is_schedulable "$cpu_index"; then
+        log_fail "CPU$cpu_index is still schedulable after being offlined"
+        failed=$((failed + 1))
+        cpu_hotplug_restore_best_effort "$cpu_index"
+        return 1
+    fi
+
+    log_pass "CPU$cpu_index successfully offlined"
+
+    log_info "Attempting to online CPU$cpu_index"
+    online_output="$(cpu_hotplug_write_state "$cpu_index" 1 "online" "$out_dir" 2>&1)"
+    online_rc=$?
+
+    if [ "$online_rc" -ne 0 ]; then
+        log_fail "CPU$cpu_index failed to online rc=$online_rc output=${online_output:-<none>}"
+        cpu_hotplug_log_dmesg_tail "$cpu_index" "online_error" "$out_dir"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    sleep "$restore_delay"
+
+    cpu_state="$(cpu_hotplug_read_state "$cpu_index")"
+
+    if [ "$cpu_state" != "1" ]; then
+        log_fail "CPU$cpu_index online state is '${cpu_state:-<empty>}' after online request, expected 1"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    if ! cpu_hotplug_in_online_mask "$cpu_index"; then
+        log_fail "CPU$cpu_index not present in online mask after online request"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    if ! cpu_is_schedulable "$cpu_index"; then
+        log_fail "CPU$cpu_index is not schedulable after online request"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    log_pass "CPU$cpu_index successfully restored online"
+    passed=$((passed + 1))
+    return 0
 }
 
 # Log topology details for one CPU.
