@@ -47,9 +47,14 @@ res_file="./$TESTNAME.res"
 out_dir="./out"
 
 HOTPLUG_BOOT_SETTLE_SECONDS="${HOTPLUG_BOOT_SETTLE_SECONDS:-10}"
-HOTPLUG_RETRIES=3
-HOTPLUG_RETRY_DELAY_SECONDS=5
-HOTPLUG_RESTORE_DELAY_SECONDS=1
+HOTPLUG_RETRIES="${HOTPLUG_RETRIES:-3}"
+HOTPLUG_RETRY_DELAY_SECONDS="${HOTPLUG_RETRY_DELAY_SECONDS:-5}"
+HOTPLUG_RESTORE_DELAY_SECONDS="${HOTPLUG_RESTORE_DELAY_SECONDS:-1}"
+
+# If a CPU returns persistent EBUSY during the first pass, do not fail
+# immediately. Continue with other CPUs and retry EBUSY CPUs at the end.
+HOTPLUG_DEFER_EBUSY="${HOTPLUG_DEFER_EBUSY:-1}"
+HOTPLUG_DEFER_PASSES="${HOTPLUG_DEFER_PASSES:-1}"
 
 # Optional debug-only override. Empty means runtime-discover all online CPUs.
 HOTPLUG_CPU_LIST="${HOTPLUG_CPU_LIST:-}"
@@ -64,7 +69,7 @@ log_info "----------------------------------------------------------------------
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 log_info "=== Test Initialization ==="
 log_info "Policy, runtime-discovered CPU hotplug validation"
-log_info "Config, BOOT_SETTLE=${HOTPLUG_BOOT_SETTLE_SECONDS}s RETRIES=$HOTPLUG_RETRIES RETRY_DELAY=${HOTPLUG_RETRY_DELAY_SECONDS}s RESTORE_DELAY=${HOTPLUG_RESTORE_DELAY_SECONDS}s"
+log_info "Config, BOOT_SETTLE=${HOTPLUG_BOOT_SETTLE_SECONDS}s RETRIES=$HOTPLUG_RETRIES RETRY_DELAY=${HOTPLUG_RETRY_DELAY_SECONDS}s RESTORE_DELAY=${HOTPLUG_RESTORE_DELAY_SECONDS}s DEFER_EBUSY=$HOTPLUG_DEFER_EBUSY DEFER_PASSES=$HOTPLUG_DEFER_PASSES"
 
 if [ -n "$HOTPLUG_CPU_LIST" ]; then
     log_info "CPU selection override, HOTPLUG_CPU_LIST=$HOTPLUG_CPU_LIST"
@@ -95,6 +100,12 @@ fi
 
 if ! check_kernel_config "CONFIG_HOTPLUG_CPU"; then
     log_fail "CONFIG_HOTPLUG_CPU is required for CPU hotplug validation"
+    echo "$TESTNAME FAIL" > "$res_file"
+    exit 1
+fi
+
+if ! command -v cpu_hotplug_validate_cpu_once >/dev/null 2>&1; then
+    log_fail "cpu_hotplug_validate_cpu_once helper is missing from functestlib.sh"
     echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
@@ -139,127 +150,102 @@ tested=0
 passed=0
 failed=0
 skipped=0
+deferred=0
+deferred_cpus=""
 
+case "$HOTPLUG_RETRIES" in
+    ''|*[!0-9]*)
+        HOTPLUG_RETRIES=3
+        ;;
+esac
+
+case "$HOTPLUG_RETRY_DELAY_SECONDS" in
+    ''|*[!0-9]*)
+        HOTPLUG_RETRY_DELAY_SECONDS=5
+        ;;
+esac
+
+case "$HOTPLUG_RESTORE_DELAY_SECONDS" in
+    ''|*[!0-9]*)
+        HOTPLUG_RESTORE_DELAY_SECONDS=1
+        ;;
+esac
+
+case "$HOTPLUG_DEFER_PASSES" in
+    ''|*[!0-9]*)
+        HOTPLUG_DEFER_PASSES=1
+        ;;
+esac
+
+if [ "$HOTPLUG_DEFER_PASSES" -lt 1 ] 2>/dev/null; then
+    HOTPLUG_DEFER_PASSES=1
+fi
+
+# Primary pass:
+# Test all selected CPUs once. CPUs that return persistent EBUSY are not failed
+# immediately when deferral is enabled; they are retried after the other CPUs.
 for cpu_index in $selected_cpus; do
-    log_info "----- Testing CPU$cpu_index -----"
+    cpu_hotplug_validate_cpu_once \
+        "$cpu_index" \
+        "primary" \
+        "$HOTPLUG_RETRIES" \
+        "$HOTPLUG_RETRY_DELAY_SECONDS" \
+        "$HOTPLUG_RESTORE_DELAY_SECONDS" \
+        "$out_dir"
 
-    if ! cpu_hotplug_in_online_mask "$cpu_index"; then
-        log_skip "CPU$cpu_index is not present in the current online CPU mask"
-        skipped=$((skipped + 1))
-        continue
+    cpu_rc=$?
+
+    if [ "$cpu_rc" -eq 2 ]; then
+        if [ "$HOTPLUG_DEFER_EBUSY" = "1" ]; then
+            log_warn "CPU$cpu_index EBUSY persisted during primary pass; deferring until after other CPUs"
+            deferred_cpus="${deferred_cpus} ${cpu_index}"
+            deferred=$((deferred + 1))
+        else
+            log_fail "CPU$cpu_index failed due to persistent EBUSY and deferral is disabled"
+            failed=$((failed + 1))
+        fi
     fi
+done
 
-    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+# Deferred pass:
+# Retry only CPUs that were busy in the primary pass. This handles early boot
+# transient EBUSY without hiding real persistent hotplug failures.
+defer_pass=1
+while [ -n "$deferred_cpus" ] && [ "$defer_pass" -le "$HOTPLUG_DEFER_PASSES" ]; do
+    retry_cpus="$deferred_cpus"
+    deferred_cpus=""
 
-    if [ ! -e "$online_file" ]; then
-        log_skip "CPU$cpu_index has no online control file; not hotplug-controllable on this platform"
-        skipped=$((skipped + 1))
-        continue
-    fi
+    log_info "Retrying EBUSY-deferred CPUs, deferred pass ${defer_pass}/${HOTPLUG_DEFER_PASSES}:$retry_cpus"
 
-    if [ ! -w "$online_file" ]; then
-        log_skip "CPU$cpu_index online control file is not writable; not hotplug-controllable in this environment"
-        skipped=$((skipped + 1))
-        continue
-    fi
+    for cpu_index in $retry_cpus; do
+        cpu_hotplug_validate_cpu_once \
+            "$cpu_index" \
+            "deferred-${defer_pass}" \
+            "$HOTPLUG_RETRIES" \
+            "$HOTPLUG_RETRY_DELAY_SECONDS" \
+            "$HOTPLUG_RESTORE_DELAY_SECONDS" \
+            "$out_dir"
 
-    controllable=$((controllable + 1))
+        cpu_rc=$?
 
-    cpu_is_schedulable "$cpu_index"
-    sched_rc=$?
+        if [ "$cpu_rc" -eq 2 ]; then
+            if [ "$defer_pass" -lt "$HOTPLUG_DEFER_PASSES" ]; then
+                log_warn "CPU$cpu_index still EBUSY; keeping for another deferred pass"
+                deferred_cpus="${deferred_cpus} ${cpu_index}"
+            else
+                log_fail "CPU$cpu_index remained EBUSY after deferred retry handling"
+                failed=$((failed + 1))
+            fi
+        fi
+    done
 
-    if [ "$sched_rc" -eq 2 ]; then
-        log_fail "taskset is not available during CPU$cpu_index schedulability check"
-        failed=$((failed + 1))
-        continue
-    fi
-
-    if [ "$sched_rc" -ne 0 ]; then
-        log_fail "CPU$cpu_index is not schedulable before hotplug"
-        failed=$((failed + 1))
-        continue
-    fi
-
-    cpu_hotplug_try_offline_with_retry "$cpu_index" "$HOTPLUG_RETRIES" "$HOTPLUG_RETRY_DELAY_SECONDS" "$out_dir"
-    offline_rc=$?
-
-    if [ "$offline_rc" -ne 0 ]; then
-        log_fail "CPU$cpu_index failed to offline after robust retry handling"
-        failed=$((failed + 1))
-        continue
-    fi
-
-    cpu_hotplug_record_offlined_cpu "$cpu_index"
-    tested=$((tested + 1))
-
-    sleep "$HOTPLUG_RESTORE_DELAY_SECONDS"
-
-    cpu_state="$(cpu_hotplug_read_state "$cpu_index")"
-
-    if [ "$cpu_state" != "0" ]; then
-        log_fail "CPU$cpu_index online state is '${cpu_state:-<empty>}' after offline request, expected 0"
-        failed=$((failed + 1))
-        cpu_hotplug_restore_best_effort "$cpu_index"
-        continue
-    fi
-
-    if cpu_hotplug_in_online_mask "$cpu_index"; then
-        log_fail "CPU$cpu_index still appears in online mask after offline request"
-        failed=$((failed + 1))
-        cpu_hotplug_restore_best_effort "$cpu_index"
-        continue
-    fi
-
-    if cpu_is_schedulable "$cpu_index"; then
-        log_fail "CPU$cpu_index is still schedulable after being offlined"
-        failed=$((failed + 1))
-        cpu_hotplug_restore_best_effort "$cpu_index"
-        continue
-    fi
-
-    log_pass "CPU$cpu_index successfully offlined"
-
-    log_info "Attempting to online CPU$cpu_index"
-    online_output="$(cpu_hotplug_write_state "$cpu_index" 1 "online" "$out_dir" 2>&1)"
-    online_rc=$?
-
-    if [ "$online_rc" -ne 0 ]; then
-        log_fail "CPU$cpu_index failed to online rc=$online_rc output=${online_output:-<none>}"
-        cpu_hotplug_log_dmesg_tail "$cpu_index" "online_error" "$out_dir"
-        failed=$((failed + 1))
-        continue
-    fi
-
-    sleep "$HOTPLUG_RESTORE_DELAY_SECONDS"
-
-    cpu_state="$(cpu_hotplug_read_state "$cpu_index")"
-
-    if [ "$cpu_state" != "1" ]; then
-        log_fail "CPU$cpu_index online state is '${cpu_state:-<empty>}' after online request, expected 1"
-        failed=$((failed + 1))
-        continue
-    fi
-
-    if ! cpu_hotplug_in_online_mask "$cpu_index"; then
-        log_fail "CPU$cpu_index not present in online mask after online request"
-        failed=$((failed + 1))
-        continue
-    fi
-
-    if ! cpu_is_schedulable "$cpu_index"; then
-        log_fail "CPU$cpu_index is not schedulable after online request"
-        failed=$((failed + 1))
-        continue
-    fi
-
-    log_pass "CPU$cpu_index successfully restored online"
-    passed=$((passed + 1))
+    defer_pass=$((defer_pass + 1))
 done
 
 cpu_hotplug_log_topology
 
 log_info "=== CPU hotplug Summary ==="
-log_info "HOTPLUG_SUMMARY: online=$online_count selected=$selected_count controllable=$controllable tested=$tested passed=$passed failed=$failed skipped=$skipped"
+log_info "HOTPLUG_SUMMARY: online=$online_count selected=$selected_count controllable=$controllable tested=$tested passed=$passed failed=$failed skipped=$skipped deferred_ebusy=$deferred"
 
 if [ "$failed" -gt 0 ]; then
     log_fail "$TESTNAME : Test Failed"
@@ -276,4 +262,3 @@ fi
 log_pass "$TESTNAME : Test Passed"
 echo "$TESTNAME PASS" > "$res_file"
 exit 0
-
